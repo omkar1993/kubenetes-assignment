@@ -1,0 +1,358 @@
+Prometheus
+**********
+
+Installation using helm repository
+**********************************
+
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm install prometheus prometheus-community/prometheus --namespace monitoring 
+kubectl get pods -n monitoring
+helm install prometheus prometheus-community/prometheus --namespace monitoring --set server.persistentVolume.enabled=false
+
+# Updating configuration file
+
+kubectl get configmap -n monitoring | grep prometheus
+kubectl get configmap prometheus-server -n monitoring -o yaml
+kubectl delete pod -l app.kubernetes.io/name=prometheus -n monitoring
+
+      # Other scrape configurations...
+      - job_name: 'application-metrics'
+        static_configs:
+          - targets:
+              - 'my-todo-app.monitoring.svc.cluster.local:5000'
+      - job_name: 'mongodb-metrics'
+        static_configs:
+          - targets:
+              - 'mongodb.application.svc.cluster.local:9216'
+
+# Updating service file
+
+kubectl edit svc prometheus-server -n monitoring
+
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    meta.helm.sh/release-name: prometheus
+    meta.helm.sh/release-namespace: monitoring
+  creationTimestamp: "2025-03-25T18:59:57Z"
+  labels:
+    app.kubernetes.io/component: server
+    app.kubernetes.io/instance: prometheus
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: prometheus
+    app.kubernetes.io/version: v3.2.1
+    helm.sh/chart: prometheus-27.7.1
+  name: prometheus-server
+  namespace: monitoring
+  resourceVersion: "58298"
+  uid: 5638c667-a537-4a0a-8147-170b1ec51202
+spec:
+  clusterIP: 10.104.152.15
+  clusterIPs:
+    - 10.104.152.15
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 9090
+      nodePort: 30090  # You can specify the NodePort here (e.g., 30090)
+  selector:
+    app.kubernetes.io/component: server
+    app.kubernetes.io/instance: prometheus
+    app.kubernetes.io/name: prometheus
+  sessionAffinity: None
+  type: NodePort  # Change from ClusterIP to NodePort
+status:
+  loadBalancer: {}
+
+# Prometheus as a NodePort service 
+
+[root@master namespaces]# kubectl get svc -n monitoring
+NAME                                  TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)        AGE
+prometheus-alertmanager               ClusterIP   10.98.189.122    <none>        9093/TCP       5m57s
+prometheus-alertmanager-headless      ClusterIP   None             <none>        9093/TCP       5m57s
+prometheus-kube-state-metrics         ClusterIP   10.98.90.76      <none>        8080/TCP       5m57s
+prometheus-prometheus-node-exporter   ClusterIP   10.109.78.229    <none>        9100/TCP       5m57s
+prometheus-prometheus-pushgateway     ClusterIP   10.105.152.253   <none>        9091/TCP       5m57s
+prometheus-server                     NodePort    10.104.152.15    <none>        80:30090/TCP   5m57s
+
+Now you can access prometheus UI with public IP:30090
+Check target for health and configuration on Prometheus UI
+
+Exporter installation
+*********************
+
+Database metrics
+****************
+
+[root@master mongo-exporter]# cat mongodb-exporter.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb-exporter
+  namespace: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb-exporter
+  template:
+    metadata:
+      labels:
+        app: mongodb-exporter
+    spec:
+      containers:
+        - name: mongodb-exporter
+          image: bitnami/mongodb-exporter:latest
+          ports:
+            - name: metrics
+              containerPort: 9216
+          env:
+            - name: MONGODB_URI
+              value: mongodb://mongodb:27017  # Make sure this is pointing to your MongoDB service
+
+[root@master mongo-exporter]# cat mongodb-exporter-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-exporter
+  namespace: application
+spec:
+  type: NodePort
+  ports:
+    - port: 9216
+      targetPort: 9216
+      nodePort: 30000  # This can be any available port on your nodes
+      name: metrics
+  selector:
+    app: mongodb-exporter
+
+[root@master mongo-exporter]# 
+
+kubectl apply -f mongodb-exporter.yaml
+kubectl apply -f mongodb-exporter-service.yaml
+
+You can access Database meterics 
+
+http://Public IP:9216/metrics
+
+Application metrics
+*******************
+
+scrape_configs:
+  - job_name: 'flask-app'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - application  # Replace with your namespace if different
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: mongodb-exporter  # Match your pod label (this will match based on the pod name or label)
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        target_label: app
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        target_label: __name__
+    static_configs:
+      - targets: ['<flask-app-service-name>:5000']  # Replace with your service name and port
+
+Mimir Installation
+******************
+
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo update
+helm install mimir grafana/mimir --namespace monitoring
+
+kubectl get configmap -n monitoring | grep prometheus
+kubectl get configmap prometheus-server -n monitoring -o yaml
+kubectl delete pod -l app.kubernetes.io/name=prometheus -n monitoring
+
+Expose mimir as a NodePort service
+kubectl patch svc mimir-query -n mimir -p '{"spec": {"type": "NodePort", "ports": [{"port": 80, "targetPort": 9090, "nodePort": 30001}]}}'
+
+Edit prometheus configuration file to write its collected metrics.
+remote_write:
+  - url: "http://mimir-distributor:7201/api/v1/prom/write"
+
+kubectl get pods -n mimir
+
+kubectl get pods -o wide -n monitoring
+kubectl get svc -o wide -n monitoring
+
+Grafana installation
+********************
+
+[root@master]# helm install grafana grafana/grafana -n monitoring
+NAME: grafana
+LAST DEPLOYED: Tue Mar 25 14:48:52 2025
+NAMESPACE: monitoring
+STATUS: deployed
+REVISION: 1
+NOTES:
+1. Get your 'admin' user password by running:
+
+   kubectl get secret --namespace monitoring grafana -o jsonpath="{.data.admin-password}" | base64 --decode ; echo
+
+
+2. The Grafana server can be accessed via port 80 on the following DNS name from within your cluster:
+
+   grafana.monitoring.svc.cluster.local
+
+   Get the Grafana URL to visit by running these commands in the same shell:
+     export POD_NAME=$(kubectl get pods --namespace monitoring -l "app.kubernetes.io/name=grafana,app.kubernetes.io/instance=grafana" -o jsonpath="{.items[0].metadata.name}")
+     kubectl --namespace monitoring port-forward $POD_NAME 3000
+
+3. Login with the password from step 1 and the username: admin
+#################################################################################
+######   WARNING: Persistence is disabled!!! You will lose your data when   #####
+######            the Grafana pod is terminated.                            #####
+#################################################################################
+[root@master]# 
+
+kubectl get svc -n monitoring
+
+Password for login
+******************
+
+kubectl exec -it grafana-6cb5c4bf7f-qj68w -n monitoring -- /bin/bash
+curl -G 'http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/query' --data-urlencode 'query={job="your_job"} |~ ".*"'
+
+Add prometheus or mimir datasource in Grafana to get data from datasource
+
+Import or create a dashboard for application as well as Database with existing available dashboard offered on Internet or create panels with queries
+*****************************************
+1. Kubernetes Cluster Overview Dashboard
+Dashboard ID: 315
+
+Description: Provides an overview of your Kubernetes cluster, including node health, pod counts, CPU usage, and memory utilization across the entire cluster.
+
+Link: Kubernetes Cluster Overview
+
+2. Kubernetes Cluster Monitoring (Prometheus Operator)
+Dashboard ID: 6417
+
+Description: A more detailed dashboard that uses the Prometheus operator to scrape metrics from Kubernetes components.
+
+Link: Kubernetes Cluster Monitoring (Prometheus Operator)
+
+3. Kubernetes Nodes Dashboard
+Dashboard ID: 10903
+
+Description: Provides detailed monitoring of the nodes in your Kubernetes cluster. This includes CPU, memory, and disk usage at the node level.
+
+Link: Kubernetes Nodes Dashboard
+
+4. Kubernetes Pods Dashboard
+Dashboard ID: 4701
+
+Description: Shows the resource usage for pods in your Kubernetes cluster. It includes CPU, memory, and network usage per pod.
+
+Link: Kubernetes Pods Dashboard
+
+5. Kubernetes Deployment Dashboard
+Dashboard ID: 12103
+
+Description: Focuses on monitoring the status of deployments and replicas in your Kubernetes cluster.
+
+Link: Kubernetes Deployment Dashboard
+
+6. Kubernetes Workloads Dashboard
+Dashboard ID: 3150
+
+Description: Displays metrics related to your Kubernetes workloads such as deployments, stateful sets, and daemon sets.
+
+Link: Kubernetes Workloads Dashboard
+
+
+1. MongoDB Overview Dashboard
+Dashboard ID: 12239
+
+Description: A complete dashboard for monitoring MongoDB. It provides insights into the replica set, disk usage, memory, and operations performed by MongoDB.
+
+Link: MongoDB Overview Dashboard
+
+2. MongoDB Monitoring (via Prometheus)
+Dashboard ID: 7585
+
+Description: This dashboard provides detailed monitoring for MongoDB, including key metrics like memory usage, CPU load, replication status, and throughput.
+
+Link: MongoDB Monitoring Dashboard
+
+3. MongoDB Replica Set Dashboard
+Dashboard ID: 3793
+
+Description: This dashboard is focused on monitoring MongoDB replica sets. It displays data such as replica set status, replication lag, and other replica-related metrics.
+
+Link: MongoDB Replica Set Dashboard
+
+4. MongoDB Metrics (for Prometheus)
+Dashboard ID: 10924
+
+Description: A MongoDB monitoring dashboard that leverages Prometheus for scraping MongoDB metrics. It provides insights into MongoDB operations, connections, and storage statistics.
+
+Link: MongoDB Metrics Dashboard
+
+Loki installation
+*****************
+
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo update
+helm install loki grafana/loki -n monitoring
+kubectl get pods -n monitoring -l app.kubernetes.io/name=loki
+
+Deploy Promtailconfig file as a configmap
+
+promtail-config.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+  namespace: monitoring
+data:
+  promtail.yaml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+    scrape_configs:
+      - job_name: application_logs
+        static_configs:
+          - targets:
+              - localhost
+            labels:
+              job: application_logs
+              path: /var/log/app.log
+      - job_name: error_logs
+        static_configs:
+          - targets:
+              - localhost
+            labels:
+              job: error_logs
+              path: /var/log/error.log
+      - job_name: mongodb_logs
+        static_configs:
+          - targets:
+              - localhost
+            labels:
+              job: mongodb_logs
+              path: /var/log/mongodb/mongodb.log
+
+kubectl apply -f promtail-config.yaml
+
+Login to grafana and add datasource for loki 
+Go to explore option and check logs according to job.
+
+

@@ -1,0 +1,262 @@
+vi /etc/selinux/config
+disabled
+sudo dnf -y install dnf-plugins-core
+sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+sudo dnf install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl status docker.service
+systemctl start docker.service
+systemctl enable docker.service
+systemctl status docker.service
+
+mkdir python-app
+
+total 16
+-rw-r--r-- 1 root root 1077 Mar 24 12:35 app.py
+-rw-r--r-- 1 root root  164 Mar 24 12:38 Dockerfile.app
+-rw-r--r-- 1 root root   37 Mar 24 12:41 Dockerfile.mongo
+-rw-r--r-- 1 root root   24 Mar 24 12:38 requirements.txt
+drwxr-xr-x 2 root root   24 Mar 24 12:40 templates
+
+app.py
+******
+
+cat app.py 
+# app.py
+from flask import Flask, render_template, request, redirect, url_for, make_response
+from pymongo import MongoClient
+import os
+import logging
+import time
+from prometheus_client import generate_latest, Counter, Histogram, CONTENT_TYPE_LATEST
+from bson.objectid import ObjectId
+
+app = Flask(__name__)
+
+# Logging Setup
+app_logger = logging.getLogger('app_logger')
+error_logger = logging.getLogger('error_logger')
+
+app_logger.setLevel(logging.INFO)
+error_logger.setLevel(logging.ERROR)
+
+app_handler = logging.FileHandler('/var/log/app.log')
+error_handler = logging.FileHandler('/var/log/error.log')
+
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+app_handler.setFormatter(formatter)
+error_handler.setFormatter(formatter)
+
+app_logger.addHandler(app_handler)
+error_logger.addHandler(error_handler)
+
+# Prometheus Metrics
+request_count = Counter('http_requests_total', 'Total HTTP Requests', ['method', 'endpoint', 'status'])
+request_latency = Histogram('http_request_latency_seconds', 'HTTP Request Latency', ['endpoint'])
+
+# MongoDB Connection
+MONGO_HOST = os.environ.get('MONGO_HOST', 'mongodb')
+MONGO_PORT = int(os.environ.get('MONGO_PORT', 27017))
+MONGO_DB = os.environ.get('MONGO_DB', 'todo_db')
+MONGO_COLLECTION = os.environ.get('MONGO_COLLECTION', 'tasks')
+
+try:
+    client = MongoClient(MONGO_HOST, MONGO_PORT)
+    db = client[MONGO_DB]
+    tasks = db[MONGO_COLLECTION]
+except Exception as e:
+    error_logger.error(f"MongoDB connection error: {e}")
+    raise
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    start_time = time.time()
+    try:
+        if request.method == 'POST':
+            task = request.form['task']
+            tasks.insert_one({'task': task})
+            app_logger.info(f"Task added: {task}")
+            request_count.labels(method='POST', endpoint='/', status=200).inc()
+            request_latency.labels(endpoint='/').observe(time.time() - start_time)
+            return redirect(url_for('index'))
+        all_tasks = tasks.find()
+        request_count.labels(method='GET', endpoint='/', status=200).inc()
+        request_latency.labels(endpoint='/').observe(time.time() - start_time)
+        return render_template('index.html', tasks=all_tasks)
+    except Exception as e:
+        error_logger.error(f"Error processing request: {e}")
+        request_count.labels(method=request.method, endpoint='/', status=500).inc()
+        request_latency.labels(endpoint='/').observe(time.time() - start_time)
+        return "Internal Server Error", 500
+
+@app.route('/delete/<task_id>')
+def delete(task_id):
+    start_time = time.time()
+    try:
+        tasks.delete_one({'_id': ObjectId(task_id)})
+        app_logger.info(f"Task deleted: {task_id}")
+        request_count.labels(method='GET', endpoint='/delete', status=200).inc()
+        request_latency.labels(endpoint='/delete').observe(time.time() - start_time)
+        return redirect(url_for('index'))
+    except Exception as e:
+        error_logger.error(f"Error deleting task: {e}")
+        request_count.labels(method='GET', endpoint='/delete', status=500).inc()
+        request_latency.labels(endpoint='/delete').observe(time.time() - start_time)
+        return "Internal Server Error", 500
+
+@app.route('/metrics')
+def metrics():
+    return make_response(generate_latest(), {'Content-Type': CONTENT_TYPE_LATEST})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+
+requirements.txt 
+****************
+
+cat requirements.txt 
+Flask
+pymongo
+dnspython
+prometheus_client
+
+Dockerfile.app
+**************
+
+# Dockerfile.app
+FROM python:3.9-slim-buster
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+EXPOSE 5000
+RUN mkdir -p /var/log
+CMD ["python", "app.py"]
+
+Dockerfile.mongo
+****************
+
+cat Dockerfile.mongo
+# Dockerfile.mongo
+FROM mongo:latest
+
+index.html 
+**********
+
+cat index.html 
+<!DOCTYPE html>
+<html>
+<head>
+    <title>To-Do List</title>
+</head>
+<body>
+    <h1>To-Do List</h1>
+    <form method="POST">
+        <input type="text" name="task" placeholder="Enter task">
+        <button type="submit">Add Task</button>
+    </form>
+    <ul>
+        {% for task in tasks %}
+        <li>
+            {{ task['task'] }}
+            <a href="/delete/{{ task['_id'] }}">Delete</a>
+        </li>
+        {% endfor %}
+    </ul>
+</body>
+</html>
+
+docker build -t my-mongo:latest -f Dockerfile.mongo .
+docker build -t my-todo-app:latest -f Dockerfile.app .
+
+
+[root@ip-172-31-81-111 python-app]# docker images                                                                                                                      
+REPOSITORY    TAG       IMAGE ID       CREATED         SIZE
+my-todo-app   latest    ab7ead377ed2   6 seconds ago   137MB
+my-mongo      latest    b81a621037ef   9 days ago      887MB
+
+[root@ip-172-31-81-111 python-app]# docker run -d --name mongodb -p 27017:27017 my-mongo:latest
+07519303bcca3a4ebd298bdb24aeb28382d76fde8b3d1b5aee9dbd4655e3a91f
+
+[root@ip-172-31-81-111 python-app]# docker ps -a
+CONTAINER ID   IMAGE             COMMAND                  CREATED         STATUS         PORTS                                             NAMES
+07519303bcca   my-mongo:latest   "docker-entrypoint.s…"   4 seconds ago   Up 4 seconds   0.0.0.0:27017->27017/tcp, [::]:27017->27017/tcp   mongodb
+
+[root@ip-172-31-81-111 python-app]# docker run -d -p 5000:5000 --link mongodb:mongodb -e MONGO_HOST=mongodb my-todo-app:latest
+8b31f0fac9b938d3eadd81e75d484541a8d2be35cf30323da8c37983a57a1dbb
+
+[root@ip-172-31-81-111 python-app]# docker ps -a
+CONTAINER ID   IMAGE                COMMAND                  CREATED          STATUS          PORTS                                             NAMES
+8b31f0fac9b9   my-todo-app:latest   "python app.py"          3 seconds ago    Up 3 seconds    0.0.0.0:5000->5000/tcp, [::]:5000->5000/tcp       nervous_perlman
+07519303bcca   my-mongo:latest      "docker-entrypoint.s…"   15 seconds ago   Up 15 seconds   0.0.0.0:27017->27017/tcp, [::]:27017->27017/tcp   mongodb
+[root@ip-172-31-81-111 python-app]# 
+
+
+yum install net-tools
+
+[root@ip-172-31-81-111 python-app]# netstat -tulnp | grep LISTEN
+tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN      1029/sshd: /usr/sbi 
+tcp        0      0 0.0.0.0:27017           0.0.0.0:*               LISTEN      2138/docker-proxy   
+tcp        0      0 0.0.0.0:5000            0.0.0.0:*               LISTEN      2285/docker-proxy   
+tcp6       0      0 :::22                   :::*                    LISTEN      1029/sshd: /usr/sbi 
+tcp6       0      0 :::27017                :::*                    LISTEN      2143/docker-proxy   
+tcp6       0      0 :::5000                 :::*                    LISTEN      2290/docker-proxy
+
+docker compose
+**************
+
+sudo curl -L "https://github.com/docker/compose/releases/download/v2.10.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
+docker-compose --version
+
+mkdir /docker-compose
+
+cat docker-compose.yml 
+version: '3.8'
+services:
+  mongodb:
+    image: my-mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db # for persistence
+  app:
+    image: my-todo-app:latest
+    ports:
+      - "5000:5000"
+    environment:
+      - MONGO_HOST=mongodb
+    depends_on:
+      - mongodb
+volumes:
+  mongo-data:
+
+
+docker-compose up -d
+
+[root@ip-172-31-81-111 ~]# docker ps -a
+CONTAINER ID   IMAGE                COMMAND                  CREATED          STATUS          PORTS                                             NAMES
+18bf5eec4db0   my-todo-app:latest   "python app.py"          48 minutes ago   Up 48 minutes   0.0.0.0:5000->5000/tcp, [::]:5000->5000/tcp       docker-compose-app-1
+571925c66c3f   my-mongo:latest      "docker-entrypoint.s…"   48 minutes ago   Up 48 minutes   0.0.0.0:27017->27017/tcp, [::]:27017->27017/tcp   docker-compose-mongodb-1
+
+
+[root@ip-172-31-81-111 ~]# docker login -u omkar1993
+
+i Info → A Personal Access Token (PAT) can be used instead.
+         To create a PAT, visit https://app.docker.com/settings
+         
+         
+Password: 
+
+WARNING! Your credentials are stored unencrypted in '/root/.docker/config.json'.
+Configure a credential helper to remove this warning. See
+https://docs.docker.com/go/credential-store/
+
+Login Succeeded
+[root@ip-172-31-81-111 ~]
+
+docker tag my-todo-app omkar1993/my-todo-app:latest
+docker tag my-mongo omkar1993/my-mongo:latest
+docker images
+docker push omkar1993/my-todo-app:latest
+docker push omkar1993/my-mongo:latest
+
